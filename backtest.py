@@ -151,10 +151,10 @@ class ChartGeometry:
 
 # --- [БЛОК СТРАТЕГИИ] ---
 class StrategyManager:
-    def __init__(self, tech, struct, smart):
+def __init__(self, tech, struct, smart):
         self.t, self.s, self.a = tech, struct, smart
         
-    def calculate_score(self):
+def calculate_score(self):
     sc = 0
     price = self.t['price']
     vwap = self.t.get('vwap', price)
