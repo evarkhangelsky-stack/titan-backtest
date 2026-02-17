@@ -193,70 +193,82 @@ class StrategyManager:
         return sc
 
 
-# --- [ГЛАВНЫЙ БЛОК ЗАПУСКА] ---
-
+# --- [ГЛАВНЫЙ БЛОК ЗАПУСКА С УЛУЧШЕННОЙ ГРАФИКОЙ И ТАБЛИЦЕЙ] ---
 import matplotlib.pyplot as plt
 import io
 
 def run_visual_backtest(symbol="ETHUSDT"):
     collector = DataCollector(symbol)
-    # Запрашиваем максимум данных
     raw = collector.get_bybit_market_data() 
+    if not raw: return
+    
     df = pd.DataFrame(raw['klines'], columns=['ts', 'o', 'h', 'l', 'c', 'v', 't'])
     for col in ['o', 'h', 'l', 'c', 'v']: df[col] = pd.to_numeric(df[col])
     
     trades_log = []
-    print(f"🧐 Анализирую историю {symbol}...")
+    print(f"🧐 Детальный анализ {symbol}...")
 
-    # Цикл бэктеста
-    for i in range(100, len(df) - 20):
-        # Эмуляция данных для анализатора
+    for i in range(150, len(df) - 20):
         temp_bundle = {'market': {'klines': raw['klines'][:i+1]}, 'blockchain': {}, 'news': []}
         
-        ana = TechnicalAnalyzer(temp_bundle)
-        tech = ana.calculate()
+        tech = TechnicalAnalyzer(temp_bundle).calculate()
         if not tech: continue
         
         geo = ChartGeometry(temp_bundle)
         struct = {'structure': geo.detect_structure(), 'patterns': geo.find_patterns()}
         
-        # Используем твой StrategyManager
+        # Мы используем твой StrategyManager
         setup = StrategyManager(tech, struct, {'ls_ratio':1, 'sentiment':'Neutral'}).generate_setup()
         
         if setup.get('side'):
-            # Проверка результата в следующих свечах
             side, entry, tp, sl = setup['side'], setup['entry'], setup['tp'], setup['sl']
             for j in range(i + 1, i + 20):
                 h, l = df['h'].iloc[j], df['l'].iloc[j]
                 res = "WIN" if (side=="LONG" and h>=tp) or (side=="SHORT" and l<=tp) else \
                       "LOSS" if (side=="LONG" and l<=sl) or (side=="SHORT" and h>=sl) else None
                 if res:
-                    trades_log.append({'idx': i, 'side': side, 'price': entry, 'res': res})
+                    trades_log.append({'idx': i, 'side': side, 'price': entry, 'res': res, 'tp': tp, 'sl': sl})
                     break
 
-    # --- ВИЗУАЛИЗАЦИЯ ---
-    plt.figure(figsize=(12, 6))
-    plt.plot(df['c'], color='#1f77b4', alpha=0.4, label='Price')
+    # --- ВИЗУАЛИЗАЦИЯ (НОВАЯ) ---
+    plt.figure(figsize=(15, 8))
+    plt.plot(df['c'], color='#2c3e50', alpha=0.3, label='Цена', linewidth=1)
     
-    # Отмечаем покупки и продажи
     for t in trades_log:
-        color = 'green' if t['side'] == 'LONG' else 'red'
+        # Вход: Синий (Long) / Оранжевый (Short)
+        entry_color = '#3498db' if t['side'] == 'LONG' else '#e67e22'
         marker = '^' if t['side'] == 'LONG' else 'v'
-        plt.scatter(t['idx'], t['price'], marker=marker, color=color, s=100)
+        plt.scatter(t['idx'], t['price'], marker=marker, color=entry_color, s=120, edgecolors='white', label=t['side'] if i==0 else "")
+        
+        # Результат: Зеленый (WIN) / Красный (LOSS)
+        res_color = '#27ae60' if t['res'] == 'WIN' else '#c0392b'
+        plt.scatter(t['idx']+2, t['price'], marker='o', color=res_color, s=50, alpha=0.7)
 
-    plt.title(f"BACKTEST {symbol} | Trades: {len(trades_log)}")
+    plt.title(f"Детальный Бэктест {symbol} | Сделок: {len(trades_log)}")
+    plt.grid(True, alpha=0.1)
     
-    # Отправка графика в Телеграм
+    # Сохраняем график
     buf = io.BytesIO()
-    plt.savefig(buf, format='png')
+    plt.savefig(buf, format='png', dpi=120)
     buf.seek(0)
-    bot.send_photo(CHAT_ID, buf, caption=f"📊 Отчет по {symbol}\nСделок: {len(trades_log)}\nВинрейт: {round(len([t for t in trades_log if t['res']=='WIN'])/len(trades_log)*100,1) if trades_log else 0}%")
-    print(f"✅ Отчет по {symbol} отправлен в Telegram!")
+    
+    # Формируем таблицу сделок (последние 15 сделок)
+    table = "📋 **Последние сделки:**\n`ID  | Тип   | Вход    | Итог`\n"
+    for t in trades_log[-15:]:
+        emoji = "✅" if t['res'] == "WIN" else "❌"
+        table += f"`{t['idx']:<4}| {t['side']:<6}| {t['price']:<8.2f}| {t['res']} {emoji}`\n"
+
+    win_count = len([t for t in trades_log if t['res']=='WIN'])
+    wr = round(win_count/len(trades_log)*100, 1) if trades_log else 0
+    
+    caption = f"📊 **Отчет {symbol}**\nВинрейт: **{wr}%**\nВсего сделок: {len(trades_log)}\n\n{table}"
+    
+    bot.send_photo(CHAT_ID, buf, caption=caption, parse_mode="Markdown")
+    plt.close()
 
 if __name__ == "__main__":
     for s in ["ETHUSDT", "BTCUSDT", "SOLUSDT"]:
         run_visual_backtest(s)
-
 
 
 
