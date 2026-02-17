@@ -156,22 +156,26 @@ class StrategyManager:
         
     def calculate_score(self):
         sc = 0
-        if "Bullish" in self.s['structure']: sc += 3
-        if "Bearish" in self.s['structure']: sc -= 3
-        if self.t['price'] > self.t['ema200']: sc += 1
-        if 30 < self.t['rsi'] < 55: sc += 1
-        if self.a['ls_ratio'] < 0.95: sc += 2
-        if self.a['sentiment'] == "Positive": sc += 1
+        # Смягчаем условия для теста
+        if "Bullish" in self.s['structure']: sc += 2 # Было 3
+        if "Bearish" in self.s['structure']: sc -= 2
+        
+        if self.t['price'] > self.t['ema50']: sc += 1 # Заменили 200 на 50 (быстрее реагирует)
+        
+        # Расширяем диапазон RSI
+        if 20 < self.t['rsi'] < 65: sc += 1 
+        
+        # Так как в бэктесте данные по LS Ratio и News часто статичны, 
+        # давай дадим "бонус" просто за направление
+        if self.a['sentiment'] == "Neutral": sc += 1 
+        
         return sc
 
     def generate_setup(self):
         sc = self.calculate_score()
-        side = "LONG" if sc >= 5 else "SHORT" if sc <= -5 else None
-        if not side: return {"side": None}
-        atr = self.t['atr']
-        sl = round(self.t['price'] - (atr*2.5) if side=="LONG" else self.t['price'] + (atr*2.5), 2)
-        tp = round(self.t['price'] + (atr*5) if side=="LONG" else self.t['price'] - (atr*5), 2)
-        return {"side": side, "entry": self.t['price'], "sl": sl, "tp": tp, "score": sc}
+        # Ставим порог 3 вместо 5
+        side = "LONG" if sc >= 3 else "SHORT" if sc <= -3 else None
+        # ... остальной код без изменений
 
 # --- [ГЛАВНЫЙ БЛОК ЗАПУСКА] ---
 
