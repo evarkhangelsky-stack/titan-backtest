@@ -17,7 +17,7 @@ class DataCollector:
     def get_bybit_market_data(self):
         try:
             url = "https://api.bybit.com/v5/market"
-            k_res = requests.get(f"{url}/kline", params={"category": "linear", "symbol": self.symbol, "interval": "15", "limit": 1000}, timeout=10).json()
+            k_res = requests.get(f"{url}/kline", params={"category": "linear", "symbol": self.symbol, "interval": "5", "limit": 1000}, timeout=10).json()
             klines = k_res['result']['list'][::-1]
             t_res = requests.get(f"{url}/tickers", params={"category": "linear", "symbol": self.symbol}, timeout=10).json()
             ticker = t_res['result']['list'][0]
@@ -155,19 +155,46 @@ class StrategyManager:
         self.t, self.s, self.a = tech, struct, smart
         
     def calculate_score(self):
-        sc = 0
-        if "Bullish" in self.s['structure']: sc += 2
-        if "Bearish" in self.s['structure']: sc -= 2
-        if self.t['price'] > self.t['ema50']: sc += 1
-        if 20 < self.t['rsi'] < 65: sc += 1 
-        if self.a['sentiment'] == "Neutral": sc += 1 
-        return sc
+    sc = 0
+    price = self.t['price']
+    vwap = self.t.get('vwap', price)
+    rsi = self.t['rsi']
+    adx = self.t['adx']
+    bb_low = self.t['bb_low']
+    bb_up = self.t['bb_up']
+    
+    # 1. ПАТТЕРН "ОТКЛОНЕНИЕ ОТ VWAP" (Mean Reversion)
+    # Если цена сильно улетела от VWAP — ждем возврат
+    if price < vwap * 0.995: # Упали на 0.5% ниже VWAP
+        sc += 1
+    elif price > vwap * 1.005: # Выросли на 0.5% выше VWAP
+        sc -= 1
 
-   
+    # 2. СКАЛЬПИНГ ПО БОЛЛИНДЖЕРУ (В боковике ADX < 25)
+    if adx < 25:
+        if price <= bb_low and rsi < 30:
+            sc += 2  # Локальное дно
+        elif price >= bb_up and rsi > 70:
+            sc -= 2  # Локальный хай
 
-    def generate_setup(self):
+    # 3. ИМПУЛЬС (Breakout) - если летим с объемами
+    if adx > 30:
+        if price > vwap and rsi > 60:
+            sc += 2  # Входим в разгон тренда
+        elif price < vwap and rsi < 40:
+            sc -= 2
+
+    # 4. СТАКАН (Orderbook Imbalance)
+    ob_ratio = TechnicalAnalyzer(self.t).analyze_orderbook() # Нужен доступ к методу
+    if ob_ratio > 0.6: sc += 1 # Покупателей больше
+    elif ob_ratio < 0.4: sc -= 1 # Продавцов больше
+
+    return sc
+
+   def generate_setup(self):
         sc = self.calculate_score()
         
+        # Пороги входа для скальпинга
         if sc >= 3:
             side = "LONG"
         elif sc <= -3:
@@ -179,8 +206,18 @@ class StrategyManager:
         if atr == 0: return {"side": None}
         
         entry = self.t['price']
-        sl = round(entry - (atr * 2.5) if side == "LONG" else entry + (atr * 2.5), 2)
-        tp = round(entry + (atr * 5) if side == "LONG" else entry - (atr * 5), 2)
+
+        # --- НОВАЯ НАСТРОЙКА ДЛЯ СКАЛЬПИНГА (М5-М15) ---
+        # Меньшие множители позволяют забирать быстрые импульсы
+        sl_mult = 1.2  # Стоп-лосс: 1.2 * ATR
+        tp_mult = 2.0  # Тейк-профит: 2.0 * ATR (соотношение риск/прибыль ~1:1.6)
+
+        if side == "LONG":
+            sl = round(entry - (atr * sl_mult), 2)
+            tp = round(entry + (atr * tp_mult), 2)
+        else: # SHORT
+            sl = round(entry + (atr * sl_mult), 2)
+            tp = round(entry - (atr * tp_mult), 2)
         
         return {
             "side": side, 
@@ -189,8 +226,6 @@ class StrategyManager:
             "tp": tp, 
             "score": sc
         }
-        
-        return sc
 
 
 # --- [ГЛАВНЫЙ БЛОК ЗАПУСКА С УЛУЧШЕННОЙ ГРАФИКОЙ И ТАБЛИЦЕЙ] ---
