@@ -156,18 +156,37 @@ class StrategyManager:
         
     def calculate_score(self):
         sc = 0
-        # Смягчаем условия для теста
-        if "Bullish" in self.s['structure']: sc += 2 # Было 3
+        if "Bullish" in self.s['structure']: sc += 2
         if "Bearish" in self.s['structure']: sc -= 2
-        
-        if self.t['price'] > self.t['ema50']: sc += 1 # Заменили 200 на 50 (быстрее реагирует)
-        
-        # Расширяем диапазон RSI
+        if self.t['price'] > self.t['ema50']: sc += 1
         if 20 < self.t['rsi'] < 65: sc += 1 
-        
-        # Так как в бэктесте данные по LS Ratio и News часто статичны, 
-        # давай дадим "бонус" просто за направление
         if self.a['sentiment'] == "Neutral": sc += 1 
+        return sc
+
+    def generate_setup(self):
+        sc = self.calculate_score()
+        
+        if sc >= 3:
+            side = "LONG"
+        elif sc <= -3:
+            side = "SHORT"
+        else:
+            return {"side": None} 
+            
+        atr = self.t.get('atr', 0)
+        if atr == 0: return {"side": None}
+        
+        entry = self.t['price']
+        sl = round(entry - (atr * 2.5) if side == "LONG" else entry + (atr * 2.5), 2)
+        tp = round(entry + (atr * 5) if side == "LONG" else entry - (atr * 5), 2)
+        
+        return {
+            "side": side, 
+            "entry": entry, 
+            "sl": sl, 
+            "tp": tp, 
+            "score": sc
+        }
         
         return sc
 
