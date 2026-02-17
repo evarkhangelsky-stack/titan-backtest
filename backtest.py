@@ -1,360 +1,494 @@
-import os, requests, numpy as np, pandas as pd, pandas_ta as ta, telebot, time
+import os
+import time
+import ccxt
+import pandas as pd
+import numpy as np
+import requests
+from datetime import datetime
+import telebot
 
-# --- [CONFIG] ---
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-DS_KEY = os.getenv("DEEPSEEK_API_KEY")
-CG_KEY = os.getenv("COINGLASS_API_KEY")
-CP_KEY = os.getenv("CRYPTOPANIC_API_KEY")
-bot = telebot.TeleBot(TOKEN)
-
-# --- [БЛОК 1: СБОР ДАННЫХ] ---
-class DataCollector:
-    def __init__(self, symbol="ETHUSDT"):
-        self.symbol = symbol
-        self.coin = symbol.replace("USDT", "")
-
-    def get_bybit_market_data(self):
-        try:
-            url = "https://api.bybit.com/v5/market"
-            k_res = requests.get(f"{url}/kline", params={"category": "linear", "symbol": self.symbol, "interval": "5", "limit": 1000}, timeout=10).json()
-            klines = k_res['result']['list'][::-1]
-            t_res = requests.get(f"{url}/tickers", params={"category": "linear", "symbol": self.symbol}, timeout=10).json()
-            ticker = t_res['result']['list'][0]
-            o_res = requests.get(f"{url}/orderbook", params={"category": "linear", "symbol": self.symbol, "limit": 50}, timeout=10).json()
-            return {"klines": klines, "ticker": ticker, "orderbook": o_res['result']}
-        except Exception as e:
-            print(f"Ошибка Bybit: {e}"); return None
-
-    def get_coinglass_data(self):
-        if not CG_KEY: return None
-        try:
-            headers = {"accept": "application/json", "CG-API-KEY": CG_KEY}
-            res = requests.get(f"https://open-api.coinglass.com/public/v2/long_short?time_type=h1&symbol={self.coin}", headers=headers, timeout=10).json()
-            return res.get('data', [{}])[0]
-        except Exception as e:
-            print(f"Ошибка Coinglass: {e}"); return None
-
-    def get_cryptopanic_news(self):
-        if not CP_KEY: return []
-        try:
-            res = requests.get(f"https://cryptopanic.com/api/v1/posts/?auth_token={CP_KEY}&currencies={self.coin}&kind=news&filter=hot", timeout=10).json()
-            return res.get('results', [])[:5]
-        except Exception as e:
-            print(f"Ошибка News: {e}"); return []
-
-    def collect_all(self):
-        return {"market": self.get_bybit_market_data(), "blockchain": self.get_coinglass_data(), "news": self.get_cryptopanic_news()}
-
-# --- [БЛОК 2-3: АНАЛИЗАТОР (ИНДИКАТОРЫ + МАТЕМАТИКА)] ---
-class TechnicalAnalyzer:
-    def __init__(self, raw_bundle):
-        self.market = raw_bundle.get('market')
+class TechnicalIndicators:
+    """Собственные технические индикаторы"""
+    
+    @staticmethod
+    def vwap(high, low, close, volume):
+        """Calculate VWAP"""
+        typical_price = (high + low + close) / 3
+        return (typical_price * volume).cumsum() / volume.cumsum()
+    
+    @staticmethod
+    def rsi(close, period=14):
+        """Calculate RSI"""
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+    
+    @staticmethod
+    def ema(close, period):
+        """Calculate EMA"""
+        return close.ewm(span=period, adjust=False).mean()
+    
+    @staticmethod
+    def atr(high, low, close, period=14):
+        """Calculate ATR"""
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        return tr.rolling(window=period).mean()
+    
+    @staticmethod
+    def bollinger_bands(close, period=20, std=2):
+        """Calculate Bollinger Bands"""
+        middle = close.rolling(window=period).mean()
+        std_dev = close.rolling(window=period).std()
+        upper = middle + (std_dev * std)
+        lower = middle - (std_dev * std)
+        return upper, middle, lower
+    
+    @staticmethod
+    def adx(high, low, close, period=14):
+        """Calculate ADX"""
+        plus_dm = high.diff()
+        minus_dm = -low.diff()
         
-    def prepare_df(self):
-        if not self.market: return None
-        df = pd.DataFrame(self.market['klines'], columns=['ts', 'o', 'h', 'l', 'c', 'v', 't'])
-        for col in ['o', 'h', 'l', 'c', 'v']: 
-            df[col] = pd.to_numeric(df[col])
+        plus_dm[plus_dm < 0] = 0
+        minus_dm[minus_dm < 0] = 0
+        
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        
+        atr = tr.rolling(window=period).mean()
+        
+        plus_di = 100 * (plus_dm.rolling(window=period).mean() / atr)
+        minus_di = 100 * (minus_dm.rolling(window=period).mean() / atr)
+        
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(window=period).mean()
+        
+        return adx, plus_di, minus_di
+
+
+class BybitScalpingBot:
+    def __init__(self):
+        # API keys from environment
+        self.api_key = os.getenv('BYBIT_API_KEY')
+        self.api_secret = os.getenv('BYBIT_API_SECRET')
+        self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
+        self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        self.deepseek_api_key = os.getenv('DEEPSEEK_API_KEY')
+        
+        if not all([self.api_key, self.api_secret, self.telegram_token, self.telegram_chat_id]):
+            raise ValueError("Missing required environment variables. Check BYBIT_API_KEY, BYBIT_API_SECRET, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
+        
+        # Initialize Bybit
+        self.exchange = ccxt.bybit({
+            'apiKey': self.api_key,
+            'secret': self.api_secret,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'linear'}  # USDT perpetual
+        })
+        
+        # Initialize Telegram
+        self.bot = telebot.TeleBot(self.telegram_token)
+        
+        # Trading parameters
+        self.symbol = 'BTC/USDT:USDT'
+        self.timeframe = '5m'
+        self.position = None
+        self.sl_atr_multiplier = 1.2
+        self.tp_atr_multiplier = 2.0
+        self.trailing_stop_percent = 0.5  # 50% of profit
+        
+        print(f"[{datetime.now()}] Bot initialized for {self.symbol} on {self.timeframe}")
+        self.send_telegram(f"🤖 Bot started\nSymbol: {self.symbol}\nTimeframe: {self.timeframe}")
+    
+    def send_telegram(self, message):
+        """Send message to Telegram"""
+        try:
+            self.bot.send_message(self.telegram_chat_id, message, parse_mode='Markdown')
+        except Exception as e:
+            print(f"Telegram error: {e}")
+    
+    def fetch_ohlcv(self, limit=1000):
+        """Fetch candlestick data from Bybit"""
+        try:
+            ohlcv = self.exchange.fetch_ohlcv(self.symbol, self.timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            return df
+        except Exception as e:
+            print(f"Error fetching OHLCV: {e}")
+            return None
+    
+    def fetch_orderbook(self):
+        """Fetch order book to check bid/ask imbalance"""
+        try:
+            orderbook = self.exchange.fetch_order_book(self.symbol, limit=20)
+            total_bids = sum([bid[1] for bid in orderbook['bids']])
+            total_asks = sum([ask[1] for ask in orderbook['asks']])
+            total = total_bids + total_asks
+            
+            bid_ratio = (total_bids / total) * 100 if total > 0 else 50
+            return bid_ratio
+        except Exception as e:
+            print(f"Error fetching orderbook: {e}")
+            return 50  # neutral
+    
+    def calculate_indicators(self, df):
+        """Calculate technical indicators"""
+        # VWAP
+        df['vwap'] = TechnicalIndicators.vwap(df['high'], df['low'], df['close'], df['volume'])
+        
+        # RSI
+        df['rsi'] = TechnicalIndicators.rsi(df['close'], period=14)
+        
+        # ADX
+        adx, di_plus, di_minus = TechnicalIndicators.adx(df['high'], df['low'], df['close'], period=14)
+        df['adx'] = adx
+        df['di_plus'] = di_plus
+        df['di_minus'] = di_minus
+        
+        # Bollinger Bands
+        bb_upper, bb_middle, bb_lower = TechnicalIndicators.bollinger_bands(df['close'], period=20, std=2)
+        df['bb_upper'] = bb_upper
+        df['bb_middle'] = bb_middle
+        df['bb_lower'] = bb_lower
+        
+        # ATR
+        df['atr'] = TechnicalIndicators.atr(df['high'], df['low'], df['close'], period=14)
+        
+        # EMAs
+        df['ema_20'] = TechnicalIndicators.ema(df['close'], period=20)
+        df['ema_50'] = TechnicalIndicators.ema(df['close'], period=50)
+        df['ema_200'] = TechnicalIndicators.ema(df['close'], period=200)
+        
         return df
-
-    def calculate(self):
-        df = self.prepare_df()
-        if df is None or len(df) < 30: return None # Проверка на достаточность данных
-        
-        res = {'price': df['c'].iloc[-1]}
-        
-        # Трендовые
-        res['ema20'] = ta.ema(df['c'], length=20).iloc[-1]
-        res['ema50'] = ta.ema(df['c'], length=50).iloc[-1]
-        res['ema200'] = ta.ema(df['c'], length=200).iloc[-1] if len(df) >= 200 else res['ema50']
-        res['vwap'] = (df['v'] * (df['h'] + df['l'] + df['c']) / 3).sum() / df['v'].sum()
-        
-        # Осцилляторы
-        res['rsi'] = ta.rsi(df['c'], length=14).iloc[-1]
-        macd = ta.macd(df['c'])
-        res['macd_h'] = macd.iloc[-1, 1] # Берем вторую колонку (гистограмму) напрямую
-        
-        # Волатильность (Исправленный блок)
-        bb = ta.bbands(df['c'], length=20, std=2)
-        # Вместо имен 'BBU_20_2.0' берем по индексу: 0 - нижняя, 1 - средняя, 2 - верхняя
-        res['bb_up'] = bb.iloc[-1, 2]
-        res['bb_low'] = bb.iloc[-1, 0]
-        
-        res['atr'] = ta.atr(df['h'], df['l'], df['c'], length=14).iloc[-1]
-        res['adx'] = ta.adx(df['h'], df['l'], df['c'], length=14).iloc[-1, 0]
-        
-        return res
-
-    def analyze_orderbook(self):
-        try:
-            if not self.market or 'orderbook' not in self.market: return 0.5
-            ob = self.market['orderbook']
-            bids = sum([float(i[1]) for i in ob['b']])
-            asks = sum([float(i[1]) for i in ob['a']])
-            return bids / (bids + asks) if (bids + asks) > 0 else 0.5
-        except: return 0.5
-
-# --- [БЛОК 4-5: SMART ANALYST & AI] ---
-class SmartAnalyst:
-    def __init__(self, tech_data, raw_bundle):
-        self.tech, self.blockchain, self.news = tech_data, raw_bundle.get('blockchain'), raw_bundle.get('news')
-
-    def analyze_all(self):
-        rep = {'ls_ratio': float(self.blockchain.get('v', 1.0)) if self.blockchain else 1.0}
-        bull_w = ['buy', 'pump', 'growth', 'surge', 'bullish', 'support']
-        score = 0
-        titles = ""
-        for n in self.news:
-            titles += n['title'] + " | "
-            if any(w in n['title'].lower() for w in bull_w): score += 1
-        rep['sentiment'] = "Positive" if score > 0 else "Neutral/Negative"
-        rep['news_summary'] = titles[:200]
-        
-        prompt = f"ETH:{self.tech['price']}. RSI:{round(self.tech['rsi'],1)}, Sent:{rep['sentiment']}. Pro assessment 15 words."
-        try:
-            res = requests.post("https://api.deepseek.com/chat/completions", headers={"Authorization": f"Bearer {DS_KEY}"},
-                               json={"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}, timeout=10).json()
-            rep['ai_verdict'] = res['choices'][0]['message']['content']
-        except: rep['ai_verdict'] = "AI Offline."
-        return rep
-
-# --- [БЛОК 6: ГРАФИКА (ГЛАЗА БОТА)] ---
-class ChartGeometry:
-    def __init__(self, raw_bundle):
-        m = raw_bundle.get('market', {})
-        self.klines = m.get('klines', [])
-        if self.klines:
-            self.c = np.array([float(x[4]) for x in self.klines])
-            self.h = np.array([float(x[2]) for x in self.klines])
-            self.l = np.array([float(x[3]) for x in self.klines])
-
-    def detect_structure(self):
-        if len(self.c) < 50: return "Unknown"
-        h, l = max(self.h[-20:-1]), min(self.l[-20:-1])
-        if self.c[-1] > h: return "BOS Bullish"
-        if self.c[-1] < l: return "BOS Bearish"
-        return "Range"
-
-    def find_patterns(self):
-        if len(self.c) < 60: return "Neutral"
-        h1, h2 = max(self.h[-40:-20]), max(self.h[-20:])
-        if abs(h1 - h2) / h1 < 0.002: return "Double Top"
-        l1, l2 = min(self.l[-40:-20]), min(self.l[-20:])
-        if abs(l1 - l2) / l1 < 0.002: return "Double Bottom"
-        return "Neutral"
-
-    def get_sr_levels(self):
-        all_p = np.concatenate([self.h[-100:], self.l[-100:]])
-        lvls = [round(p, 2) for p in all_p if np.sum(np.abs(all_p - p) / p < 0.001) > 3]
-        return sorted(list(set(lvls)))[-3:]
-
-# --- [БЛОК СТРАТЕГИИ] ---
-class StrategyManager:
-def __init__(self, tech, struct, smart):
-        self.t, self.s, self.a = tech, struct, smart
-        
-def calculate_score(self):
-    sc = 0
-    price = self.t['price']
-    vwap = self.t.get('vwap', price)
-    rsi = self.t['rsi']
-    adx = self.t['adx']
-    bb_low = self.t['bb_low']
-    bb_up = self.t['bb_up']
     
-    # 1. ПАТТЕРН "ОТКЛОНЕНИЕ ОТ VWAP" (Mean Reversion)
-    # Если цена сильно улетела от VWAP — ждем возврат
-    if price < vwap * 0.995: # Упали на 0.5% ниже VWAP
-        sc += 1
-    elif price > vwap * 1.005: # Выросли на 0.5% выше VWAP
-        sc -= 1
-
-    # 2. СКАЛЬПИНГ ПО БОЛЛИНДЖЕРУ (В боковике ADX < 25)
-    if adx < 25:
-        if price <= bb_low and rsi < 30:
-            sc += 2  # Локальное дно
-        elif price >= bb_up and rsi > 70:
-            sc -= 2  # Локальный хай
-
-    # 3. ИМПУЛЬС (Breakout) - если летим с объемами
-    if adx > 30:
-        if price > vwap and rsi > 60:
-            sc += 2  # Входим в разгон тренда
-        elif price < vwap and rsi < 40:
-            sc -= 2
-
-    # 4. СТАКАН (Orderbook Imbalance)
-    ob_ratio = TechnicalAnalyzer(self.t).analyze_orderbook() # Нужен доступ к методу
-    if ob_ratio > 0.6: sc += 1 # Покупателей больше
-    elif ob_ratio < 0.4: sc -= 1 # Продавцов больше
-
-    return sc
-
-   def generate_setup(self):
-        sc = self.calculate_score()
+    def get_ai_filter(self, df, signal_type):
+        """Get AI filtering from DeepSeek"""
+        if not self.deepseek_api_key:
+            return True  # Skip AI if no key provided
         
-        # Пороги входа для скальпинга
-        if sc >= 3:
-            side = "LONG"
-        elif sc <= -3:
-            side = "SHORT"
+        try:
+            last_row = df.iloc[-1]
+            
+            prompt = f"""Analyze this trading signal:
+Symbol: BTC/USDT
+Signal: {signal_type}
+Price: ${last_row['close']:.2f}
+RSI: {last_row['rsi']:.2f}
+ADX: {last_row['adx']:.2f}
+Price vs VWAP: {'Above' if last_row['close'] > last_row['vwap'] else 'Below'}
+EMA Trend: {'Bullish' if last_row['ema_20'] > last_row['ema_50'] else 'Bearish'}
+
+Reply with ONLY one word: "Approve" or "Reject"
+"""
+            
+            response = requests.post(
+                'https://api.deepseek.com/v1/chat/completions',
+                headers={
+                    'Authorization': f'Bearer {self.deepseek_api_key}',
+                    'Content-Type': 'application/json'
+                },
+                json={
+                    'model': 'deepseek-chat',
+                    'messages': [{'role': 'user', 'content': prompt}],
+                    'temperature': 0.3,
+                    'max_tokens': 10
+                },
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                ai_response = response.json()['choices'][0]['message']['content'].strip().lower()
+                approved = 'approve' in ai_response
+                print(f"AI Filter: {ai_response} -> {'✅ Approved' if approved else '❌ Rejected'}")
+                return approved
+            else:
+                print(f"AI API error: {response.status_code}")
+                return True  # Default to approve if API fails
+                
+        except Exception as e:
+            print(f"AI Filter error: {e}")
+            return True  # Default to approve if error
+    
+    def detect_signal(self, df):
+        """Detect trading signals based on scalping strategy"""
+        last_row = df.iloc[-1]
+        
+        price = last_row['close']
+        rsi = last_row['rsi']
+        adx = last_row['adx']
+        vwap = last_row['vwap']
+        bb_upper = last_row['bb_upper']
+        bb_lower = last_row['bb_lower']
+        ema_20 = last_row['ema_20']
+        ema_50 = last_row['ema_50']
+        atr = last_row['atr']
+        
+        # Skip if NaN values
+        if pd.isna([price, rsi, adx, vwap, atr]).any():
+            return None, None, None
+        
+        # Check orderbook imbalance
+        bid_ratio = self.fetch_orderbook()
+        
+        signal = None
+        signal_type = None
+        
+        # Phase detection
+        if adx < 25:
+            # Sideways market - trade Bollinger Bands + RSI
+            if price <= bb_lower and rsi < 30 and bid_ratio > 60:
+                signal = 'LONG'
+                signal_type = 'Sideways Bounce'
+            elif price >= bb_upper and rsi > 70 and bid_ratio < 40:
+                signal = 'SHORT'
+                signal_type = 'Sideways Rejection'
         else:
-            return {"side": None} 
+            # Trending market - trade with EMA + VWAP
+            if price > vwap and ema_20 > ema_50 and rsi > 40 and rsi < 70 and bid_ratio > 60:
+                signal = 'LONG'
+                signal_type = 'Trend Follow'
+            elif price < vwap and ema_20 < ema_50 and rsi < 60 and rsi > 30 and bid_ratio < 40:
+                signal = 'SHORT'
+                signal_type = 'Trend Follow'
+        
+        if signal:
+            # AI Filter
+            if not self.get_ai_filter(df, signal):
+                print(f"❌ Signal {signal} rejected by AI filter")
+                return None, None, None
             
-        atr = self.t.get('atr', 0)
-        if atr == 0: return {"side": None}
+            # Calculate SL and TP
+            if signal == 'LONG':
+                entry = price
+                stop_loss = entry - (self.sl_atr_multiplier * atr)
+                take_profit = entry + (self.tp_atr_multiplier * atr)
+            else:
+                entry = price
+                stop_loss = entry + (self.sl_atr_multiplier * atr)
+                take_profit = entry - (self.tp_atr_multiplier * atr)
+            
+            return signal, signal_type, {
+                'entry': entry,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'atr': atr,
+                'rsi': rsi,
+                'adx': adx,
+                'bid_ratio': bid_ratio
+            }
         
-        entry = self.t['price']
-
-        # --- НОВАЯ НАСТРОЙКА ДЛЯ СКАЛЬПИНГА (М5-М15) ---
-        # Меньшие множители позволяют забирать быстрые импульсы
-        sl_mult = 1.2  # Стоп-лосс: 1.2 * ATR
-        tp_mult = 2.0  # Тейк-профит: 2.0 * ATR (соотношение риск/прибыль ~1:1.6)
-
-        if side == "LONG":
-            sl = round(entry - (atr * sl_mult), 2)
-            tp = round(entry + (atr * tp_mult), 2)
-        else: # SHORT
-            sl = round(entry + (atr * sl_mult), 2)
-            tp = round(entry - (atr * tp_mult), 2)
-        
-        return {
-            "side": side, 
-            "entry": entry, 
-            "sl": sl, 
-            "tp": tp, 
-            "score": sc
-        }
-
-
-# --- [ГЛАВНЫЙ БЛОК ЗАПУСКА С УЛУЧШЕННОЙ ГРАФИКОЙ И ТАБЛИЦЕЙ] ---
-import matplotlib.pyplot as plt
-import io
-
-def run_visual_backtest(symbol="ETHUSDT"):
-    collector = DataCollector(symbol)
-    raw = collector.get_bybit_market_data() 
-    if not raw: return
+        return None, None, None
     
-    df = pd.DataFrame(raw['klines'], columns=['ts', 'o', 'h', 'l', 'c', 'v', 't'])
-    for col in ['o', 'h', 'l', 'c', 'v']: df[col] = pd.to_numeric(df[col])
+    def place_order(self, signal, params):
+        """Place order on Bybit (DEMO MODE - uncomment for live trading)"""
+        try:
+            # Calculate position size (example: risk 1% of balance)
+            balance = self.get_balance()
+            risk_amount = balance * 0.01
+            position_size = risk_amount / abs(params['entry'] - params['stop_loss'])
+            
+            # Round to proper precision
+            position_size = round(position_size, 3)
+            
+            message = f"""
+🎯 *Signal Detected*
+Type: {signal}
+Entry: ${params['entry']:.2f}
+Stop Loss: ${params['stop_loss']:.2f}
+Take Profit: ${params['take_profit']:.2f}
+Size: {position_size} BTC
+RSI: {params['rsi']:.1f}
+ADX: {params['adx']:.1f}
+Orderbook: {params['bid_ratio']:.1f}% bids
+"""
+            
+            print(message)
+            self.send_telegram(message)
+            
+            # UNCOMMENT FOR LIVE TRADING
+            # order = self.exchange.create_market_order(
+            #     symbol=self.symbol,
+            #     side='buy' if signal == 'LONG' else 'sell',
+            #     amount=position_size
+            # )
+            
+            # Store position
+            self.position = {
+                'side': signal,
+                'entry': params['entry'],
+                'stop_loss': params['stop_loss'],
+                'take_profit': params['take_profit'],
+                'size': position_size,
+                'entry_time': datetime.now(),
+                'trailing_stop_activated': False
+            }
+            
+            print(f"✅ Order placed: {signal} {position_size} BTC @ ${params['entry']:.2f}")
+            
+        except Exception as e:
+            print(f"Error placing order: {e}")
+            self.send_telegram(f"❌ Order error: {str(e)}")
     
-    trades_log = []
-    print(f"🧐 Запуск умного бэктеста {symbol}...")
-
-    last_trade_idx = 0
-    cooldown = 15  # Не заходим в сделки слишком часто (защита от "ножей")
-
-    for i in range(200, len(df) - 20):
-        # Пропускаем итерацию, если мы в "режиме ожидания" после сделки
-        if i < last_trade_idx + cooldown: 
-            continue 
+    def get_balance(self):
+        """Get USDT balance"""
+        try:
+            balance = self.exchange.fetch_balance()
+            return balance['USDT']['free']
+        except:
+            return 10000  # Demo balance
+    
+    def manage_position(self, df):
+        """Manage open position with trailing stop"""
+        if not self.position:
+            return
+        
+        current_price = df.iloc[-1]['close']
+        side = self.position['side']
+        entry = self.position['entry']
+        sl = self.position['stop_loss']
+        tp = self.position['take_profit']
+        
+        # Calculate P&L
+        if side == 'LONG':
+            pnl_percent = ((current_price - entry) / entry) * 100
             
-        temp_bundle = {'market': {'klines': raw['klines'][:i+1]}, 'blockchain': {}, 'news': []}
-        
-        tech = TechnicalAnalyzer(temp_bundle).calculate()
-        if not tech: continue
-        
-        geo = ChartGeometry(temp_bundle)
-        struct = {'structure': geo.detect_structure(), 'patterns': geo.find_patterns()}
-        
-        # Анализ через StrategyManager
-        setup = StrategyManager(tech, struct, {'ls_ratio':1, 'sentiment':'Neutral'}).generate_setup()
-        
-        if setup.get('side'):
-            side, entry, tp, sl = setup['side'], setup['entry'], setup['tp'], setup['sl']
+            # Check stop loss
+            if current_price <= sl:
+                self.close_position(current_price, 'Stop Loss Hit')
+                return
             
-            # Проверяем, что случилось с ценой в следующие 20 свечей
-            for j in range(i + 1, i + 20):
-                h, l = df['h'].iloc[j], df['l'].iloc[j]
+            # Check take profit
+            if current_price >= tp:
+                self.close_position(current_price, 'Take Profit Hit')
+                return
+            
+            # Trailing stop logic
+            if pnl_percent > self.trailing_stop_percent * 100:
+                if not self.position['trailing_stop_activated']:
+                    # Move SL to breakeven
+                    self.position['stop_loss'] = entry
+                    self.position['trailing_stop_activated'] = True
+                    print(f"🎯 Trailing stop activated - SL moved to breakeven")
+                    self.send_telegram(f"🎯 Trailing stop activated\nNew SL: ${entry:.2f}")
+        
+        else:  # SHORT
+            pnl_percent = ((entry - current_price) / entry) * 100
+            
+            if current_price >= sl:
+                self.close_position(current_price, 'Stop Loss Hit')
+                return
+            
+            if current_price <= tp:
+                self.close_position(current_price, 'Take Profit Hit')
+                return
+            
+            if pnl_percent > self.trailing_stop_percent * 100:
+                if not self.position['trailing_stop_activated']:
+                    self.position['stop_loss'] = entry
+                    self.position['trailing_stop_activated'] = True
+                    print(f"🎯 Trailing stop activated - SL moved to breakeven")
+                    self.send_telegram(f"🎯 Trailing stop activated\nNew SL: ${entry:.2f}")
+    
+    def close_position(self, exit_price, reason):
+        """Close position"""
+        if not self.position:
+            return
+        
+        side = self.position['side']
+        entry = self.position['entry']
+        size = self.position['size']
+        
+        # Calculate P&L
+        if side == 'LONG':
+            pnl = (exit_price - entry) * size
+            pnl_percent = ((exit_price - entry) / entry) * 100
+        else:
+            pnl = (entry - exit_price) * size
+            pnl_percent = ((entry - exit_price) / entry) * 100
+        
+        duration = datetime.now() - self.position['entry_time']
+        
+        message = f"""
+{'✅' if pnl > 0 else '❌'} *Position Closed*
+Reason: {reason}
+Side: {side}
+Entry: ${entry:.2f}
+Exit: ${exit_price:.2f}
+P&L: ${pnl:.2f} ({pnl_percent:+.2f}%)
+Duration: {duration}
+"""
+        
+        print(message)
+        self.send_telegram(message)
+        
+        # UNCOMMENT FOR LIVE TRADING
+        # self.exchange.create_market_order(
+        #     symbol=self.symbol,
+        #     side='sell' if side == 'LONG' else 'buy',
+        #     amount=size
+        # )
+        
+        self.position = None
+    
+    def run(self):
+        """Main bot loop"""
+        print(f"\n{'='*50}")
+        print(f"🚀 Bybit Scalping Bot Started")
+        print(f"{'='*50}\n")
+        
+        while True:
+            try:
+                print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checking market...")
                 
-                res = None
-                if side == "LONG":
-                    if h >= tp: res = "WIN"
-                    elif l <= sl: res = "LOSS"
-                else: # SHORT
-                    if l <= tp: res = "WIN"
-                    elif h >= sl: res = "LOSS"
+                # Fetch data
+                df = self.fetch_ohlcv()
+                if df is None:
+                    print("Failed to fetch data, retrying in 60s...")
+                    time.sleep(60)
+                    continue
                 
-                if res:
-                    trades_log.append({'idx': i, 'side': side, 'price': entry, 'res': res, 'tp': tp, 'sl': sl})
-                    last_trade_idx = i  # Фиксируем время сделки, чтобы включить cooldown
-                    break
+                # Calculate indicators
+                df = self.calculate_indicators(df)
+                
+                # Check if we have an open position
+                if self.position:
+                    self.manage_position(df)
+                else:
+                    # Look for new signal
+                    signal, signal_type, params = self.detect_signal(df)
+                    
+                    if signal:
+                        print(f"📊 Signal found: {signal} ({signal_type})")
+                        self.place_order(signal, params)
+                    else:
+                        print("No signal detected")
+                
+                # Display current market state
+                last = df.iloc[-1]
+                print(f"Price: ${last['close']:.2f} | RSI: {last['rsi']:.1f} | ADX: {last['adx']:.1f}")
+                
+                # Wait for next candle (5 minutes)
+                print(f"Next check in 5 minutes...")
+                time.sleep(300)
+                
+            except KeyboardInterrupt:
+                print("\n\n👋 Bot stopped by user")
+                self.send_telegram("🛑 Bot stopped")
+                break
+            except Exception as e:
+                print(f"❌ Error in main loop: {e}")
+                self.send_telegram(f"❌ Bot error: {str(e)}")
+                time.sleep(60)
 
-    # --- ВИЗУАЛИЗАЦИЯ И ОТПРАВКА ---
-    plt.figure(figsize=(15, 8))
-    plt.plot(df['c'], color='#2c3e50', alpha=0.3, label='Цена')
-    
-    for t in trades_log:
-        entry_color = '#3498db' if t['side'] == 'LONG' else '#e67e22'
-        res_color = '#27ae60' if t['res'] == 'WIN' else '#c0392b'
-        
-        # Рисуем вход (треугольник) и результат (точка чуть правее)
-        plt.scatter(t['idx'], t['price'], marker='^' if t['side']=='LONG' else 'v', color=entry_color, s=100, edgecolors='white')
-        plt.scatter(t['idx']+1, t['price'], marker='o', color=res_color, s=40, alpha=0.8)
-
-    plt.title(f"Smart Backtest {symbol} | Сделок: {len(trades_log)}")
-    plt.grid(True, alpha=0.1)
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=120)
-    buf.seek(0)
-    
-    # Таблица для Телеграм
-    table = "📋 **Результаты (последние):**\n`ID  | Тип   | Вход    | Итог`\n"
-    for t in trades_log[-15:]:
-        icon = "✅" if t['res'] == "WIN" else "❌"
-        table += f"`{t['idx']:<4}| {t['side']:<6}| {t['price']:<8.1f}| {t['res']} {icon}`\n"
-
-    win_count = len([t for t in trades_log if t['res']=='WIN'])
-    wr = round(win_count/len(trades_log)*100, 1) if trades_log else 0
-    
-    caption = f"📊 **Бэктест {symbol}**\nВинрейт: **{wr}%**\nСделок: {len(trades_log)}\n\n{table}"
-    
-    bot.send_photo(CHAT_ID, buf, caption=caption, parse_mode="Markdown")
-    plt.close()
-
-    # --- ВИЗУАЛИЗАЦИЯ (НОВАЯ) ---
-    plt.figure(figsize=(15, 8))
-    plt.plot(df['c'], color='#2c3e50', alpha=0.3, label='Цена', linewidth=1)
-    
-    for t in trades_log:
-        # Вход: Синий (Long) / Оранжевый (Short)
-        entry_color = '#3498db' if t['side'] == 'LONG' else '#e67e22'
-        marker = '^' if t['side'] == 'LONG' else 'v'
-        plt.scatter(t['idx'], t['price'], marker=marker, color=entry_color, s=120, edgecolors='white', label=t['side'] if i==0 else "")
-        
-        # Результат: Зеленый (WIN) / Красный (LOSS)
-        res_color = '#27ae60' if t['res'] == 'WIN' else '#c0392b'
-        plt.scatter(t['idx']+2, t['price'], marker='o', color=res_color, s=50, alpha=0.7)
-
-    plt.title(f"Детальный Бэктест {symbol} | Сделок: {len(trades_log)}")
-    plt.grid(True, alpha=0.1)
-    
-    # Сохраняем график
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=120)
-    buf.seek(0)
-    
-    # Формируем таблицу сделок (последние 15 сделок)
-    table = "📋 **Последние сделки:**\n`ID  | Тип   | Вход    | Итог`\n"
-    for t in trades_log[-15:]:
-        emoji = "✅" if t['res'] == "WIN" else "❌"
-        table += f"`{t['idx']:<4}| {t['side']:<6}| {t['price']:<8.2f}| {t['res']} {emoji}`\n"
-
-    win_count = len([t for t in trades_log if t['res']=='WIN'])
-    wr = round(win_count/len(trades_log)*100, 1) if trades_log else 0
-    
-    caption = f"📊 **Отчет {symbol}**\nВинрейт: **{wr}%**\nВсего сделок: {len(trades_log)}\n\n{table}"
-    
-    bot.send_photo(CHAT_ID, buf, caption=caption, parse_mode="Markdown")
-    plt.close()
 
 if __name__ == "__main__":
-    for s in ["ETHUSDT", "BTCUSDT", "SOLUSDT"]:
-        run_visual_backtest(s)
-
-
-
-
+    bot = BybitScalpingBot()
+    bot.run()
