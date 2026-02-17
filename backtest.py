@@ -171,11 +171,19 @@ class StrategyManager:
         
         return sc
 
-    def generate_setup(self):
+   def generate_setup(self):
         sc = self.calculate_score()
-        # Ставим порог 3 вместо 5
         side = "LONG" if sc >= 3 else "SHORT" if sc <= -3 else None
-        # ... остальной код без изменений
+        
+        # Если сигнала нет, мы ДОЛЖНЫ вернуть словарь с None, а не просто пустоту
+        if not side: 
+            return {"side": None} 
+            
+        atr = self.t['atr']
+        sl = round(self.t['price'] - (atr*2.5) if side=="LONG" else self.t['price'] + (atr*2.5), 2)
+        tp = round(self.t['price'] + (atr*5) if side=="LONG" else self.t['price'] - (atr*5), 2)
+        
+        return {"side": side, "entry": self.t['price'], "sl": sl, "tp": tp, "score": sc}
 
 # --- [ГЛАВНЫЙ БЛОК ЗАПУСКА] ---
 
