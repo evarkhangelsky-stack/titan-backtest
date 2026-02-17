@@ -216,6 +216,7 @@ class StrategyManager:
             "tp": tp, 
             "score": sc
         }
+       
 # --- [ГЛАВНЫЙ БЛОК ЗАПУСКА] ---
 
 import matplotlib.pyplot as plt
