@@ -1,3 +1,4 @@
+ccxt
 pyTelegramBotAPI
 requests
 numpy
