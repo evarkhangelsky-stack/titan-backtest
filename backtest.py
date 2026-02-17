@@ -206,9 +206,16 @@ def run_visual_backtest(symbol="ETHUSDT"):
     for col in ['o', 'h', 'l', 'c', 'v']: df[col] = pd.to_numeric(df[col])
     
     trades_log = []
-    print(f"🧐 Детальный анализ {symbol}...")
+    print(f"🧐 Запуск умного бэктеста {symbol}...")
 
-    for i in range(150, len(df) - 20):
+    last_trade_idx = 0
+    cooldown = 15  # Не заходим в сделки слишком часто (защита от "ножей")
+
+    for i in range(200, len(df) - 20):
+        # Пропускаем итерацию, если мы в "режиме ожидания" после сделки
+        if i < last_trade_idx + cooldown: 
+            continue 
+            
         temp_bundle = {'market': {'klines': raw['klines'][:i+1]}, 'blockchain': {}, 'news': []}
         
         tech = TechnicalAnalyzer(temp_bundle).calculate()
@@ -217,18 +224,61 @@ def run_visual_backtest(symbol="ETHUSDT"):
         geo = ChartGeometry(temp_bundle)
         struct = {'structure': geo.detect_structure(), 'patterns': geo.find_patterns()}
         
-        # Мы используем твой StrategyManager
+        # Анализ через StrategyManager
         setup = StrategyManager(tech, struct, {'ls_ratio':1, 'sentiment':'Neutral'}).generate_setup()
         
         if setup.get('side'):
             side, entry, tp, sl = setup['side'], setup['entry'], setup['tp'], setup['sl']
+            
+            # Проверяем, что случилось с ценой в следующие 20 свечей
             for j in range(i + 1, i + 20):
                 h, l = df['h'].iloc[j], df['l'].iloc[j]
-                res = "WIN" if (side=="LONG" and h>=tp) or (side=="SHORT" and l<=tp) else \
-                      "LOSS" if (side=="LONG" and l<=sl) or (side=="SHORT" and h>=sl) else None
+                
+                res = None
+                if side == "LONG":
+                    if h >= tp: res = "WIN"
+                    elif l <= sl: res = "LOSS"
+                else: # SHORT
+                    if l <= tp: res = "WIN"
+                    elif h >= sl: res = "LOSS"
+                
                 if res:
                     trades_log.append({'idx': i, 'side': side, 'price': entry, 'res': res, 'tp': tp, 'sl': sl})
+                    last_trade_idx = i  # Фиксируем время сделки, чтобы включить cooldown
                     break
+
+    # --- ВИЗУАЛИЗАЦИЯ И ОТПРАВКА ---
+    plt.figure(figsize=(15, 8))
+    plt.plot(df['c'], color='#2c3e50', alpha=0.3, label='Цена')
+    
+    for t in trades_log:
+        entry_color = '#3498db' if t['side'] == 'LONG' else '#e67e22'
+        res_color = '#27ae60' if t['res'] == 'WIN' else '#c0392b'
+        
+        # Рисуем вход (треугольник) и результат (точка чуть правее)
+        plt.scatter(t['idx'], t['price'], marker='^' if t['side']=='LONG' else 'v', color=entry_color, s=100, edgecolors='white')
+        plt.scatter(t['idx']+1, t['price'], marker='o', color=res_color, s=40, alpha=0.8)
+
+    plt.title(f"Smart Backtest {symbol} | Сделок: {len(trades_log)}")
+    plt.grid(True, alpha=0.1)
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=120)
+    buf.seek(0)
+    
+    # Таблица для Телеграм
+    table = "📋 **Результаты (последние):**\n`ID  | Тип   | Вход    | Итог`\n"
+    for t in trades_log[-15:]:
+        icon = "✅" if t['res'] == "WIN" else "❌"
+        table += f"`{t['idx']:<4}| {t['side']:<6}| {t['price']:<8.1f}| {t['res']} {icon}`\n"
+
+    win_count = len([t for t in trades_log if t['res']=='WIN'])
+    wr = round(win_count/len(trades_log)*100, 1) if trades_log else 0
+    
+    caption = f"📊 **Бэктест {symbol}**\nВинрейт: **{wr}%**\nСделок: {len(trades_log)}\n\n{table}"
+    
+    bot.send_photo(CHAT_ID, buf, caption=caption, parse_mode="Markdown")
+    plt.close()
 
     # --- ВИЗУАЛИЗАЦИЯ (НОВАЯ) ---
     plt.figure(figsize=(15, 8))
