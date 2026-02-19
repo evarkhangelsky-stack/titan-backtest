@@ -1,7 +1,0 @@
-ccxt
-pyTelegramBotAPI
-requests
-numpy
-pandas
-pandas_ta
-matplotlib
