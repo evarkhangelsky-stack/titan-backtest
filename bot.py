@@ -8,15 +8,6 @@ from datetime import datetime
 import telebot
 
 # ==========================================
-# НАСТРОЙКИ РИСК-МЕНЕДЖМЕНТА
-# ==========================================
-RISK_PER_TRADE = 0.01          # Риск 1% от баланса
-DAILY_LOSS_LIMIT_PCT = 0.05    # Остановка если минус 5% за день
-MAX_DAILY_LOSSES = 4           # Остановка если 4 стопа подряд
-PARTIAL_TP_PCT = 0.25          # Закрыть 50% позиции на 1/4 пути к Тейку
-ADX_MAX_FILTER = 45            # Не входить в контртренд если ADX > 45
-
-# ==========================================
 # БЛОК ИНДИКАТОРОВ (ПОЛНОСТЬЮ ИЗ PDF)
 # ==========================================
 class TechnicalIndicators:
@@ -67,25 +58,6 @@ class TechnicalIndicators:
 # ==========================================
 # ОСНОВНОЙ КЛАСС (ПОЛНАЯ ВЕРСИЯ)
 # ==========================================
-class TradingStats:
-    def __init__(self):
-        self.daily_pnl = 0.0
-        self.daily_losses_count = 0
-        self.last_reset_day = datetime.now(np.datetime64('now', 'UTC')).day
-        self.trading_halted = False
-
-    def check_reset(self):
-        # Проверка смены дня по UTC
-        now_utc = datetime.now(np.datetime64('now', 'UTC'))
-        if now_utc.day != self.last_reset_day:
-            print(f"🚀 {now_utc.strftime('%Y-%m-%d')} - Новый торговый день! Лимиты сброшены.")
-            self.daily_pnl = 0.0
-            self.daily_losses_count = 0
-            self.last_reset_day = now_utc.day
-            self.trading_halted = False
-
-stats = TradingStats()
-
 class BybitScalpingBot:
     def __init__(self):
         # API Ключи
@@ -191,89 +163,37 @@ class BybitScalpingBot:
             sl = entry - (self.sl_atr_multiplier * last['atr']) if signal == 'LONG' else entry + (self.sl_atr_multiplier * last['atr'])
             tp = entry + (self.tp_atr_multiplier * last['atr']) if signal == 'LONG' else entry - (self.tp_atr_multiplier * last['atr'])
             return signal, {'entry': entry, 'sl': sl, 'tp': tp, 'news': news, 'cg': cg}
-
-# Фильтр ADX (не лезем против паровоза)
-        if last['adx'] > ADX_MAX_FILTER:
-            return None, None        
-        
         return None, None
 
     # --- УПРАВЛЕНИЕ ПОЗИЦИЯМИ (ПОЛНОСТЬЮ ИЗ PDF) ---
-def manage_position(self, symbol, df):
+    def manage_position(self, symbol, df):
+        if symbol not in self.active_positions: return
         pos = self.active_positions[symbol]
         last_price = df.iloc[-1]['close']
         
-        # Считаем текущий прогресс (0.0 до 1.0)
-        total_move = abs(pos['tp'] - pos['entry'])
-        if total_move == 0: return
+        print(f"[{symbol}] Monitoring {pos['type']}. Current: {last_price}, TP: {pos['tp']}, SL: {pos['sl']}")
         
-        current_move = (last_price - pos['entry']) if pos['side'] == 'buy' else (pos['entry'] - last_price)
-        progress = current_move / total_move
+        hit_tp = (pos['type'] == 'LONG' and last_price >= pos['tp']) or (pos['type'] == 'SHORT' and last_price <= pos['tp'])
+        hit_sl = (pos['type'] == 'LONG' and last_price <= pos['sl']) or (pos['type'] == 'SHORT' and last_price >= pos['sl'])
 
-        # 1. ЧАСТИЧНЫЙ ФИКС (50%) И БЕЗУБЫТОК
-        if progress >= PARTIAL_TP_PCT and not pos['half_closed']:
-            try:
-                # Закрываем половину
-                half_qty = float(pos['qty']) / 2
-                side_close = 'sell' if pos['side'] == 'buy' else 'buy'
-                self.exchange.create_order(symbol, 'market', side_close, half_qty)
-                
-                # Двигаем стоп в безубыток (в коде памяти)
-                pos['sl'] = pos['entry']
-                pos['half_closed'] = True
-                self.send_telegram(f"✅ {symbol}: 50% профита закрыто. Стоп в БЕЗУБЫТКЕ.")
-            except Exception as e:
-                print(f"Ошибка фиксации: {e}")
-
-        # 2. ПРОВЕРКА ВЫХОДА ПО ТЕЙКУ ИЛИ СТОПУ
-        is_hit_tp = (last_price >= pos['tp']) if pos['side'] == 'buy' else (last_price <= pos['tp'])
-        is_hit_sl = (last_price <= pos['sl']) if pos['side'] == 'buy' else (last_price >= pos['sl'])
-
-        if is_hit_tp or is_hit_sl:
-            res = "PROFIT" if is_hit_tp else "LOSS"
-            # Логика закрытия остатка...
-            if res == "LOSS":
-                stats.daily_losses_count += 1
-                if stats.daily_losses_count >= MAX_DAILY_LOSSES:
-                    stats.trading_halted = True
-            
+        if hit_tp or hit_sl:
+            reason = "Take Profit" if hit_tp else "Stop Loss"
+            print(f"Closing {symbol} by {reason}")
             del self.active_positions[symbol]
-            self.send_telegram(f"🏁 {symbol} закрыт: {res}")
-
-def calculate_qty(self, symbol, entry, sl):
-        try:
-            balance = float(self.exchange.fetch_balance()['total']['USDT'])
-            risk_usd = balance * RISK_PER_TRADE
-            stop_dist = abs(entry - sl)
-            if stop_dist == 0: return 0
-            
-            qty = risk_usd / stop_dist
-            # Округление для биржи
-            markets = self.exchange.market(symbol)
-            return self.exchange.amount_to_precision(symbol, qty)
-        except:
-            return 0
+            self.send_telegram(f"📉 *Closed* {symbol}\nReason: {reason}\nPrice: {last_price}")
 
     def place_order(self, symbol, signal, params):
-        if stats.trading_halted:
-            print("🚫 Торговля остановлена из-за дневных лимитов.")
-            return
-
+        # Логика расчета объема (из PDF)
         try:
-            side = 'buy' if signal == 'LONG' else 'sell'
-            qty = self.calculate_qty(symbol, params['entry'], params['sl'])
+            balance = self.exchange.fetch_balance()['total'].get('USDT', 0)
+            print(f"Balance: {balance} USDT. Risking {self.risk_per_trade*100}%")
             
-            # Вход по рынку
-            order = self.exchange.create_order(symbol, 'market', side, qty)
-            
+            # Сохраняем виртуально (для Demo режима)
             self.active_positions[symbol] = {
-                'id': order['id'],
-                'side': side,
+                'type': signal,
                 'entry': params['entry'],
                 'sl': params['sl'],
-                'tp': params['tp'],
-                'qty': qty,
-                'half_closed': False # Флаг для фиксации 50%
+                'tp': params['tp']
             }
             
             self.send_telegram(f"🎯 *{signal} Signal* on {symbol}\nEntry: {params['entry']}\nSL: {params['sl']:.2f}\nTP: {params['tp']:.2f}\nNews: {params['news']}")
@@ -281,10 +201,6 @@ def calculate_qty(self, symbol, entry, sl):
             print(f"Order Error: {e}")
 
     def run(self):
-        while True:
-            stats.check_reset() # Сброс лимитов в 00:00 UTC
-            for symbol in self.symbols:
-                # ... твой остальной код ...
         print(f"\n{'='*50}\n Bybit Scalping Bot Started (Multi-Symbol)\n{'='*50}\n")
         while True:
             for symbol in self.symbols:
